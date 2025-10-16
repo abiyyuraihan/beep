@@ -64,13 +64,17 @@ export default function App(){
     disconnectHandlerRef.current = onDisconnect;
   }, [append]);
 
-  const connectToDevice = useCallback(async (device: BluetoothDevice) => {
+  type ConnectOptions = { suppressErrorStatus?: boolean };
+
+  const connectToDevice = useCallback(async (
+    device: BluetoothDevice,
+    options: ConnectOptions = {},
+  ) => {
     registerDisconnectHandler(device);
 
     try{
       setStatus("Connecting…");
       append(`Connecting to ${device.name || device.id}`);
-
       const server = await device.gatt!.connect();
       const service = await server.getPrimaryService(SERVICE_UUID);
       const characteristic = await service.getCharacteristic(CHAR_UUID);
@@ -79,11 +83,15 @@ export default function App(){
 
       setStatus("Connected (notifications on)");
       append("Connected & listening for notifications");
+      return { ok: true as const };
     }catch(err: any){
       console.error(err);
-      setStatus("Error / Cancelled");
+      charRef.current = null;
+      if (!options.suppressErrorStatus){
+        setStatus("Error / Cancelled");
+      }
       append(`Error: ${err?.message || err}`);
-      throw err;
+      return { ok: false as const, error: err };
     }
   }, [append, registerDisconnectHandler, setupNotifications]);
 
@@ -104,23 +112,41 @@ export default function App(){
     localStorage.setItem(DEVICE_STORAGE_KEY, device.id);
     append(`Saved device id ${device.id} for auto reconnect`);
 
-    await connectToDevice(device);
+    return connectToDevice(device);
   }, [append, connectToDevice]);
 
   const connectBLE = useCallback(async () => {
     if (deviceRef.current){
+      append("Attempting to reconnect using saved device in memory.");
+      const result = await connectToDevice(deviceRef.current);
+      if (result.ok) return;
+    }
+
+    const rememberedId = localStorage.getItem(DEVICE_STORAGE_KEY);
+    if (rememberedId && navigator.bluetooth && typeof navigator.bluetooth.getDevices === "function"){
+      append("Checking saved devices list for quick reconnect.");
       try{
-        append("Attempting to reconnect using saved device.");
-        await connectToDevice(deviceRef.current);
-        return;
-      }catch{
-        // fall back to request flow if reconnect fails
+        const devices = await navigator.bluetooth.getDevices();
+        const saved = devices.find(d => d.id === rememberedId);
+        if (saved){
+          deviceRef.current = saved;
+          const result = await connectToDevice(saved);
+          if (result.ok) return;
+        }else{
+          append("Saved device not found in getDevices result. Need manual selection.");
+        }
+      }catch(err: any){
+        console.error(err);
+        append(`Quick reconnect failed: ${err?.message || err}`);
       }
     }
 
     try{
-      await requestDeviceAndConnect();
-    }catch(err){
+      const result = await requestDeviceAndConnect();
+      if (!result?.ok){
+        // error already handled upstream
+      }
+    }catch{
       // error already handled upstream
     }
   }, [append, connectToDevice, requestDeviceAndConnect]);
@@ -160,10 +186,21 @@ export default function App(){
 
         append(`Found saved device ${saved.name || saved.id}. Reconnecting…`);
 
-        try{
-          await connectToDevice(saved);
-        }catch{
-          // connectToDevice already logs status
+        const result = await connectToDevice(saved, { suppressErrorStatus: true });
+        if (!result.ok){
+          const message = result.error?.message || String(result.error || "");
+          const requiresGesture =
+            result.error?.name === "SecurityError" ||
+            /gesture|activation/i.test(message);
+
+          if (requiresGesture){
+            append("Browser requires a user gesture to reconnect. Click Connect BLE.");
+            setStatus("Waiting for user action");
+            deviceRef.current = saved;
+          }else{
+            append("Auto reconnect failed. Please reconnect manually.");
+            setStatus("Auto reconnect failed");
+          }
         }
       })
       .catch(err => {

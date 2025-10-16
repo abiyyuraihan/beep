@@ -57,7 +57,7 @@ export default function App() {
         deviceRef.current = device;
         disconnectHandlerRef.current = onDisconnect;
     }, [append]);
-    const connectToDevice = useCallback(async (device) => {
+    const connectToDevice = useCallback(async (device, options = {}) => {
         registerDisconnectHandler(device);
         try {
             setStatus("Connecting…");
@@ -68,12 +68,16 @@ export default function App() {
             await setupNotifications(characteristic);
             setStatus("Connected (notifications on)");
             append("Connected & listening for notifications");
+            return { ok: true };
         }
         catch (err) {
             console.error(err);
-            setStatus("Error / Cancelled");
+            charRef.current = null;
+            if (!options.suppressErrorStatus) {
+                setStatus("Error / Cancelled");
+            }
             append(`Error: ${err?.message || err}`);
-            throw err;
+            return { ok: false, error: err };
         }
     }, [append, registerDisconnectHandler, setupNotifications]);
     const requestDeviceAndConnect = useCallback(async () => {
@@ -89,23 +93,43 @@ export default function App() {
         });
         localStorage.setItem(DEVICE_STORAGE_KEY, device.id);
         append(`Saved device id ${device.id} for auto reconnect`);
-        await connectToDevice(device);
+        return connectToDevice(device);
     }, [append, connectToDevice]);
     const connectBLE = useCallback(async () => {
         if (deviceRef.current) {
-            try {
-                append("Attempting to reconnect using saved device.");
-                await connectToDevice(deviceRef.current);
+            append("Attempting to reconnect using saved device in memory.");
+            const result = await connectToDevice(deviceRef.current);
+            if (result.ok)
                 return;
+        }
+        const rememberedId = localStorage.getItem(DEVICE_STORAGE_KEY);
+        if (rememberedId && navigator.bluetooth && typeof navigator.bluetooth.getDevices === "function") {
+            append("Checking saved devices list for quick reconnect.");
+            try {
+                const devices = await navigator.bluetooth.getDevices();
+                const saved = devices.find(d => d.id === rememberedId);
+                if (saved) {
+                    deviceRef.current = saved;
+                    const result = await connectToDevice(saved);
+                    if (result.ok)
+                        return;
+                }
+                else {
+                    append("Saved device not found in getDevices result. Need manual selection.");
+                }
             }
-            catch {
-                // fall back to request flow if reconnect fails
+            catch (err) {
+                console.error(err);
+                append(`Quick reconnect failed: ${err?.message || err}`);
             }
         }
         try {
-            await requestDeviceAndConnect();
+            const result = await requestDeviceAndConnect();
+            if (!result?.ok) {
+                // error already handled upstream
+            }
         }
-        catch (err) {
+        catch {
             // error already handled upstream
         }
     }, [append, connectToDevice, requestDeviceAndConnect]);
@@ -138,11 +162,20 @@ export default function App() {
                 return;
             }
             append(`Found saved device ${saved.name || saved.id}. Reconnecting…`);
-            try {
-                await connectToDevice(saved);
-            }
-            catch {
-                // connectToDevice already logs status
+            const result = await connectToDevice(saved, { suppressErrorStatus: true });
+            if (!result.ok) {
+                const message = result.error?.message || String(result.error || "");
+                const requiresGesture = result.error?.name === "SecurityError" ||
+                    /gesture|activation/i.test(message);
+                if (requiresGesture) {
+                    append("Browser requires a user gesture to reconnect. Click Connect BLE.");
+                    setStatus("Waiting for user action");
+                    deviceRef.current = saved;
+                }
+                else {
+                    append("Auto reconnect failed. Please reconnect manually.");
+                    setStatus("Auto reconnect failed");
+                }
             }
         })
             .catch(err => {
